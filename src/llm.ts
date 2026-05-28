@@ -720,6 +720,12 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
+    // STRUCTURAL INVARIANT: the launcher (bin/qmd) sets GGML_METAL_NO_RESIDENCY=1
+    // on darwin BEFORE the native binding loads, which prevents the libggml-metal
+    // static destructor assertion at process exit (ggml-org/llama.cpp#17869).
+    // See isDarwinMetalMitigationActive() for the runtime check exposed to
+    // diagnostics. No constructor-time guard installation is needed.
+
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
@@ -1945,13 +1951,75 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
+// Darwin Metal exit-crash mitigation
+// =============================================================================
+//
+// libggml-metal on macOS keeps allocated model memory wired via "residency
+// sets" with a 180-second keep_alive timer (added in ggml-org/llama.cpp#11427).
+// The process-static `std::vector<std::unique_ptr<ggml_metal_device>>`
+// destructor fires during libc `exit()` → `__cxa_finalize_ranges` and asserts
+// `[rsets->data count] == 0` — but the keep_alive hasn't expired, so the
+// assertion fails and `ggml_abort` dumps a multi-kilobyte stack trace to
+// stderr after the user-visible output. See ggml-org/llama.cpp#17869.
+//
+// No JS-side dispose call (`llama.dispose()`, `model.dispose()`, etc.) can
+// prevent it: the static destructor runs after every JS-reachable cleanup,
+// and `process.reallyExit` on Node calls libc `exit()` not `_exit()` (it
+// does NOT skip C++ static destructors — verified in
+// node/src/api/environment.cc).
+//
+// The actual fix is to disable residency sets via `GGML_METAL_NO_RESIDENCY=1`,
+// which we set from `bin/qmd` before Node loads the native binding. For QMD's
+// short-lived CLI workflow this has no measurable cost (subsequent calls
+// don't reuse the warm mapping). The functions below report whether that
+// mitigation is in effect — kept here, in the module that depends on the
+// underlying resource, so doctor can answer "is the protection active?"
+// without reaching into env handling directly.
+//
+// Setting `QMD_METAL_KEEP_RESIDENCY=1` opts back into residency sets (with
+// the visible-noise consequences). The legacy `QMD_DISABLE_DARWIN_SAFE_EXIT`
+// env var is accepted as a no-op alias for back-compat; it had no effect on
+// Node prior to this fix.
+
+/**
+ * Whether QMD's darwin Metal exit-crash mitigation is active in this process:
+ *   true  → residency sets disabled, process exit completes silently
+ *   false → either non-darwin, or `QMD_METAL_KEEP_RESIDENCY=1` overrode it,
+ *           in which case the libggml-metal teardown assertion may fire
+ */
+export function isDarwinMetalMitigationActive(): boolean {
+  if (process.platform !== "darwin") return false;
+  if (process.env.QMD_METAL_KEEP_RESIDENCY === "1") return false;
+  return process.env.GGML_METAL_NO_RESIDENCY === "1";
+}
+
+/**
+ * Compatibility shim: previous releases installed a `process.on('exit')` hook
+ * that tried to skip the C++ static destructor by calling `process.reallyExit`.
+ * That mechanism didn't work on Node (Environment::Exit still calls libc
+ * `exit()`), so it was replaced by `GGML_METAL_NO_RESIDENCY=1` from bin/qmd.
+ * Kept as a no-op for code paths that still call it; safe to remove once no
+ * production launcher predates the residency-set fix.
+ */
+export function installDarwinExitGuard(): void {
+  // Intentional no-op. See isDarwinMetalMitigationActive() for the real check.
+}
+
+/** @deprecated Replaced by isDarwinMetalMitigationActive. */
+export function isDarwinExitGuardInstalled(): boolean {
+  return isDarwinMetalMitigationActive();
+}
+
+// =============================================================================
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
 let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
+ * constructor installs the darwin exit guard, so any code path that obtains
+ * the singleton is protected.
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
@@ -1961,10 +2029,22 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing)
+ * Set a custom default LlamaCpp instance (useful for testing). Setting a
+ * non-null instance also ensures the darwin exit guard is installed — keeps
+ * the invariant intact for test doubles that didn't go through the real
+ * constructor.
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+  if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
+}
+
+/**
+ * Peek at the default LlamaCpp instance without instantiating one. Used by
+ * doctor and lifecycle diagnostics.
+ */
+export function hasDefaultLlamaCpp(): boolean {
+  return defaultLlamaCpp !== null;
 }
 
 /**

@@ -639,7 +639,7 @@ describe("CLI Status Command", () => {
       QMD_EMBED_CONTEXT_SIZE: "1024",
       QMD_EDITOR_URI: "vscode://file/{file}:{line}:{col}",
       QMD_SKILLS_DIR: "/tmp/qmd-skills",
-      QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT: "1",
+      QMD_METAL_KEEP_RESIDENCY: "1",
       NO_COLOR: "1",
       CI: "1",
       HF_ENDPOINT: "https://hf-mirror.com",

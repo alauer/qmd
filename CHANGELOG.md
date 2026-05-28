@@ -43,6 +43,21 @@
   copy the entire working tree (including `.git` and `bun.lock`) into the
   install dir and previously routed through Bun, causing ABI mismatches with
   the Node-built `better-sqlite3` / `sqlite-vec` native modules.
+- Darwin Metal: launcher (`bin/qmd`) and `bun test` preload now set
+  `GGML_METAL_NO_RESIDENCY=1` by default on macOS to disable libggml-metal's
+  residency-set keep-alive timer. Previously, llama-using commands (`query`,
+  `vsearch`, `embed`) and the test runner dumped a multi-kB GGML/Metal
+  backtrace at process exit even when output succeeded
+  (ggml-org/llama.cpp#17869) — the static `ggml_metal_device` destructor
+  asserts `[rsets->data count] == 0` during `__cxa_finalize_ranges`, but the
+  residency set's 180 s keep-alive timer hasn't expired yet. Residency sets
+  give no measurable speedup for QMD's short-lived CLI workflow (benchmarked
+  on M3 Pro), so disabling them is a pure win. The Bun preload uses
+  `bun:ffi` to call libc `setenv()` directly because Bun does not propagate
+  `process.env` mutations through to native `getenv()` (Node does). Opt back
+  in with `QMD_METAL_KEEP_RESIDENCY=1` for long-lived qmd processes (e.g. the
+  MCP daemon may benefit on hot reload) or to triage the upstream fix.
+  `qmd doctor` now reports the mitigation state.
 
 ### Docs
 

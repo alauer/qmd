@@ -30,6 +30,27 @@ if (process.argv[2] === "mcp") {
   process.env.GGML_BACKEND_SILENT = process.env.GGML_BACKEND_SILENT || "1";
 }
 
+// libggml-metal on macOS uses "residency sets" to keep allocated model memory
+// resident across inference requests (180-second keep_alive timer). The
+// process-static device destructor that runs during libc exit() asserts the
+// residency set is empty (ggml-org/llama.cpp#17869); the keep_alive hasn't
+// expired by exit, so the assertion fails and ggml_abort dumps a multi-kB
+// stack trace to stderr even when the user-visible results were already
+// emitted correctly. No JS-side dispose can prevent it because the static
+// destructor runs in __cxa_finalize_ranges, after every JS-reachable cleanup.
+//
+// For QMD's short-lived CLI workflow, residency sets provide no observable
+// performance benefit (subsequent requests don't reuse the warm mapping —
+// measured: identical wall time with and without on M3 Pro), so disable them
+// by default on darwin. The env var must be set BEFORE the native llama.cpp
+// binding loads, which is why it lives here in the launcher rather than in
+// the JS entry point. Opt back in with QMD_METAL_KEEP_RESIDENCY=1 if you
+// run long-lived qmd processes (the MCP daemon may benefit on hot reload)
+// or are triaging an upstream Metal teardown fix.
+if (process.platform === "darwin" && process.env.QMD_METAL_KEEP_RESIDENCY !== "1") {
+  process.env.GGML_METAL_NO_RESIDENCY = process.env.GGML_METAL_NO_RESIDENCY || "1";
+}
+
 function hasBun() {
   try {
     const res = spawnSync("bun", ["--version"], { stdio: "ignore", shell: process.platform === "win32" });

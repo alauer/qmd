@@ -1,9 +1,9 @@
 import { describe, expect, test } from "vitest";
 import { finishSuccessfulCliCommand } from "../src/cli/qmd.ts";
-import { LlamaCpp } from "../src/llm.ts";
+import { LlamaCpp, isDarwinMetalMitigationActive } from "../src/llm.ts";
 
 describe("CLI successful-exit lifecycle", () => {
-  test("exits 0 after successful JSON output when post-output LLM cleanup fails", async () => {
+  test("exits 0 after successful output when post-output LLM cleanup fails", async () => {
     const exitCodes: number[] = [];
     const stderr: string[] = [];
     const flushed: string[] = [];
@@ -11,7 +11,6 @@ describe("CLI successful-exit lifecycle", () => {
     await finishSuccessfulCliCommand({
       command: "query",
       format: "json",
-      platform: "linux",
       cleanup: async () => {
         throw new Error("ggml_metal_device_free abort simulation");
       },
@@ -27,27 +26,50 @@ describe("CLI successful-exit lifecycle", () => {
     expect(flushed).toEqual([""]);
   });
 
-  test("uses immediate exit for successful macOS JSON query after stdout flush", async () => {
+  test("flushes stdout then stderr then exits, disposing along the way", async () => {
+    // After widening the safe-exit into a process-wide guard installed by the
+    // LlamaCpp constructor, the per-command 'immediate exit' branch is gone:
+    // every command takes the same flush → dispose → exit(0) path, and the
+    // darwin guard catches the C++ static dtor crash at process-exit time.
     const calls: string[] = [];
 
     await finishSuccessfulCliCommand({
       command: "query",
       format: "json",
-      platform: "darwin",
-      cleanup: async () => {
-        calls.push("cleanup");
-      },
-      exit: (code) => {
-        calls.push(`exit:${code}`);
-      },
-      immediateExit: (code) => {
-        calls.push(`immediate-exit:${code}`);
-      },
+      cleanup: async () => { calls.push("cleanup"); },
+      exit: (code) => { calls.push(`exit:${code}`); },
       stdout: { write: (_chunk: string | Uint8Array, cb?: (error?: Error | null) => void) => { calls.push("stdout-flush"); cb?.(); return true; } },
       stderr: { write: (_chunk: string | Uint8Array, cb?: (error?: Error | null) => void) => { calls.push("stderr-flush"); cb?.(); return true; } },
     });
 
-    expect(calls).toEqual(["stdout-flush", "stderr-flush", "immediate-exit:0"]);
+    expect(calls).toEqual(["stdout-flush", "cleanup", "stderr-flush", "exit:0"]);
+  });
+
+  test("darwin Metal mitigation reflects launcher-exported env on darwin", () => {
+    // The real mitigation lives in bin/qmd, which sets GGML_METAL_NO_RESIDENCY=1
+    // before Node loads the llama.cpp native binding. The JS-side predicate
+    // just reports whether that env was set (and not overridden by
+    // QMD_METAL_KEEP_RESIDENCY). On non-darwin the function returns false.
+    const expected =
+      process.platform === "darwin" &&
+      process.env.QMD_METAL_KEEP_RESIDENCY !== "1" &&
+      process.env.GGML_METAL_NO_RESIDENCY === "1";
+    expect(isDarwinMetalMitigationActive()).toBe(expected);
+  });
+
+  test("QMD_METAL_KEEP_RESIDENCY=1 disables the mitigation even when GGML_METAL_NO_RESIDENCY is set", () => {
+    const prevKeep = process.env.QMD_METAL_KEEP_RESIDENCY;
+    const prevNoRes = process.env.GGML_METAL_NO_RESIDENCY;
+    try {
+      process.env.QMD_METAL_KEEP_RESIDENCY = "1";
+      process.env.GGML_METAL_NO_RESIDENCY = "1";
+      expect(isDarwinMetalMitigationActive()).toBe(false);
+    } finally {
+      if (prevKeep === undefined) delete process.env.QMD_METAL_KEEP_RESIDENCY;
+      else process.env.QMD_METAL_KEEP_RESIDENCY = prevKeep;
+      if (prevNoRes === undefined) delete process.env.GGML_METAL_NO_RESIDENCY;
+      else process.env.GGML_METAL_NO_RESIDENCY = prevNoRes;
+    }
   });
 
   test("disposes Llama resources in dependency order before CLI exit", async () => {

@@ -81,7 +81,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -225,10 +225,8 @@ type FinishSuccessfulCliCommandOptions = {
   format?: OutputFormat;
   cleanup?: () => Promise<void>;
   exit?: (code: number) => void;
-  immediateExit?: (code: number) => void;
   stdout?: CliLifecycleWritable;
   stderr?: CliLifecycleWritable;
-  platform?: NodeJS.Platform;
 };
 
 async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
@@ -237,43 +235,23 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
   });
 }
 
-function shouldBypassNativeCleanup(options: FinishSuccessfulCliCommandOptions): boolean {
-  return (
-    (options.platform ?? process.platform) === "darwin" &&
-    options.command === "query" &&
-    options.format === "json" &&
-    process.env.QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT !== "1"
-  );
-}
-
-function immediateProcessExit(code: number): void {
-  const processWithReallyExit = process as NodeJS.Process & { reallyExit?: (code?: number) => void };
-  if (typeof processWithReallyExit.reallyExit === "function") {
-    processWithReallyExit.reallyExit(code);
-    return;
-  }
-  process.exit(code);
-}
-
 /**
- * Finish a successful CLI command after output has been flushed. On macOS JSON
- * query runs, skip normal native teardown and use Node/Bun's immediate exit path:
- * ggml Metal can abort from C++ finalizers after valid JSON has already been
- * produced (#368). This wrapper is only reached after the command completed, so
- * real query failures still exit through the normal error path before this runs.
+ * Finish a successful CLI command after output has been flushed.
+ *
+ * Best-effort llama disposal (JS-side resources only): if it throws, we still
+ * exit 0 because the user's output is already on the wire. The libggml-metal
+ * static-destructor crash on darwin (ggml-org/llama.cpp#17869) is prevented
+ * by `bin/qmd` exporting `GGML_METAL_NO_RESIDENCY=1` before the native
+ * binding loads — see `isDarwinMetalMitigationActive` in `src/llm.ts` for
+ * the runtime check exposed to diagnostics. Every code path that touches
+ * Metal (query, vsearch, embed, expand) is covered by that single env var,
+ * with no per-command bypass logic required here.
  */
 export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCommandOptions): Promise<void> {
   const stderr = options.stderr ?? process.stderr;
   const exit = options.exit ?? ((code: number) => process.exit(code));
-  const immediateExit = options.immediateExit ?? immediateProcessExit;
 
   await flushWritable(options.stdout ?? process.stdout);
-
-  if (shouldBypassNativeCleanup(options)) {
-    await flushWritable(stderr);
-    immediateExit(0);
-    return;
-  }
 
   try {
     await (options.cleanup ?? disposeDefaultLlamaCpp)();
@@ -3609,7 +3587,8 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");
   add("QMD_EDITOR_URI", "overrides clickable editor link template in terminal output");
   add("QMD_SKILLS_DIR", "overrides where qmd skills are discovered from");
-  add("QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT", "disables macOS JSON-query safe exit workaround; may re-expose Metal finalizer crashes");
+  add("QMD_METAL_KEEP_RESIDENCY", "opts back into libggml-metal residency sets on darwin; restores ~0ms perf wins for long-lived processes but re-exposes the static-destructor backtrace dump at process exit (ggml-org/llama.cpp#17869)");
+  add("GGML_METAL_NO_RESIDENCY", "set automatically by the launcher on darwin to disable Metal residency sets (avoids ggml-org/llama.cpp#17869); override via QMD_METAL_KEEP_RESIDENCY=1");
   add("NO_COLOR", "disables colored terminal output");
   add("CI", "disables real LLM operations inside QMD's LlamaCpp wrapper");
   add("HF_ENDPOINT", "changes Hugging Face download endpoint used when pulling models");
@@ -3888,6 +3867,29 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
         : `${parts.join("; ")}. Next: check QMD_LLAMA_GPU and llama.cpp backend support`);
       if (!device.gpuOffloading) {
         nextSteps.push("GPU was detected but offloading is disabled; check `QMD_LLAMA_GPU=metal|cuda|vulkan` and rerun `qmd doctor`.");
+      }
+
+      // Surface the darwin residency-set mitigation. libggml-metal's
+      // process-static device dtor asserts on un-expired residency sets
+      // during libc exit() (ggml-org/llama.cpp#17869), producing a giant
+      // stderr backtrace after correct output. The bin/qmd launcher exports
+      // GGML_METAL_NO_RESIDENCY=1 on darwin to skip the assertion entirely.
+      // No measurable perf cost on short-lived CLI calls.
+      if (device.gpu === "metal" && process.platform === "darwin") {
+        if (isDarwinMetalMitigationActive()) {
+          doctorCheck(
+            "darwin metal residency",
+            true,
+            "GGML_METAL_NO_RESIDENCY=1 set by launcher; clean process exit (avoids ggml-org/llama.cpp#17869). Opt back in with QMD_METAL_KEEP_RESIDENCY=1 if you run long-lived qmd processes."
+          );
+        } else {
+          doctorCheck(
+            "darwin metal residency",
+            false,
+            "residency sets active (QMD_METAL_KEEP_RESIDENCY=1 or launcher bypassed); llama-using commands may dump a libggml-metal backtrace at exit (ggml-org/llama.cpp#17869) even when output succeeded."
+          );
+          nextSteps.push("Unset `QMD_METAL_KEEP_RESIDENCY` so the launcher can disable Metal residency sets; without this, query/vsearch/embed dump a stack trace at exit even on success.");
+        }
       }
     } else {
       const cudaDiagnostic = linuxCudaRuntimeDiagnostic();
