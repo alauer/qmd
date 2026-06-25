@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Spec ID | `qmd-remote-llm-port` |
-| Status | Draft for review |
+| Status | Ready for implementation (spec contract; open questions resolved) |
 | Author | Coda (analysis of `lauerprojects/qmd-remote-llm.git` `@6b1336c`) |
 | Target | `alauer/qmd.git` mainline (HEAD `e428df7`, v2.6.3 at time of analysis) |
 | Source feature branch | `lauerprojects/qmd-remote-llm.git` `remote-llm` (HEAD `6b1336c`) |
@@ -47,8 +47,11 @@ than necessary.
   the local cache schema (`llm_cache`, `vectors_vec`) without migration.
 - **G6.** Bring the existing fork's test suite (`remote-llm.test.ts`,
   `hybrid-llm.test.ts`) over so the new code paths are exercised in CI.
-- **G7.** Keep the `LLM` interface change minimal — the fork widened it to 10
-  methods; mainline only needs a 4-method widening for the chunking call site.
+- **G7.** Widen the `LLM` interface from 6 to 9 methods (add `embedBatch`,
+  `tokenize`, `detokenize`). This is the smallest widening that lets
+  `chunkDocumentByTokens`, the embed batch path, and the chunked rerank call site
+  all go through the same `getDefaultLLM()` factory. `getDeviceInfo()` stays a
+  concrete method on `LlamaCpp`/`HybridLLM` (CLI status only).
 
 ### Non-goals
 
@@ -126,7 +129,7 @@ stays:
 Three concrete classes, one interface. Each backend is independently testable via
 `vi.mock`. The wrapper is the only place that knows about routing.
 
-### Interface shape (the one design decision that diverges from the fork)
+### Interface shape — final decision
 
 Mainline's current `LLM` interface (in `src/llm.ts` line 521) has **6 methods**:
 
@@ -134,52 +137,48 @@ Mainline's current `LLM` interface (in `src/llm.ts` line 521) has **6 methods**:
 embed, generate, modelExists, expandQuery, rerank, dispose
 ```
 
-The fork's `llm-types.ts` widened this to **10 methods** to add:
+The fork's `llm-types.ts` widened this to **10 methods** by adding:
 
 ```typescript
 embedBatch, tokenize, detokenize, getDeviceInfo
 ```
 
-Mainline is more conservative and exposes batch ops via `ILLMSession`, not the `LLM`
-interface itself. Two of those four (`tokenize`, `detokenize`) are used directly on
-the LLM from `chunkDocumentByTokens` in mainline (`src/store.ts:2795,2832`); today
-that call site works because it uses `getDefaultLlamaCpp()` (concrete type), not
-`getDefaultLLM()`.
+**Final decision (locked): the mainline `LLM` interface becomes 9 methods.**
+Concretely: current 6 + `embedBatch` + `tokenize` + `detokenize`.
+`getDeviceInfo()` stays a concrete method on `LlamaCpp` and `HybridLLM` (CLI
+status calls it directly on the concrete singleton; it is not part of the
+`LLM` contract).
 
-**Decision: keep the `LLM` interface at 6 methods in mainline, plus `embedBatch`.**
-That is, port 7 of the fork's 10 methods (the 6 mainline already has + `embedBatch`).
-`tokenize`/`detokenize`/`getDeviceInfo` stay concrete-class-only:
+Rationale:
 
-- `chunkDocumentByTokens` continues to call `getDefaultLlamaCpp()` (which the fork
-  already changed; revert that line to `getDefaultLlamaCpp()` in this port, with
-  HybridLLM *also* being usable when its `tokenize` proxy is set to `local`).
-  Actually cleaner: change `chunkDocumentByTokens` to use `getDefaultLLM()` and
-  add `tokenize`/`detokenize` to the interface — only **3** extra methods to port
-  rather than narrowing 4. See *Open question O1* below.
-- `getDeviceInfo()` is called by `qmd status`; we can either expose it via the
-  interface (1 method) or via a separate `getDeviceInfo()` helper that inspects
-  the singleton's underlying `LlamaCpp`. Interface method is cleaner.
+- `embedBatch` is already implemented on `LlamaCpp` in mainline
+  (`src/llm.ts:214`); promoting it to the interface is a no-op for the local
+  path and is required for `HybridLLM` to expose it without `instanceof` checks.
+- `tokenize` / `detokenize` are called from `chunkDocumentByTokens`
+  (`src/store.ts:2795, 2832`). Today that call site works because it uses
+  `getDefaultLlamaCpp()` (concrete type) and a strict cast; the port moves
+  those call sites onto `getDefaultLLM()` and adds `tokenize`/`detokenize` to
+  the interface so `HybridLLM` is a true `LLM` rather than a partial duck-type.
+- `getDeviceInfo` has a single call site (`qmd status`). Adding it to the
+  interface would force `RemoteLLM` to fake GPU/Metal/VRAM values it has no
+  way to know. Keep it concrete-class-only and have `qmd status` cast
+  through `getDefaultLlamaCpp()` (or read it from the `HybridLLM.local`
+  field when only the wrapper is available).
 
-**Final interface (proposed): 9 methods on `LLM`** — current 6 + `embedBatch` +
-`tokenize` + `detokenize`. `getDeviceInfo` stays a `LlamaCpp`/HybridLLM concrete
-method, not in the interface, because only CLI status needs it.
-
-This is the only public-surface change in the port. All 5 other fork methods are
-either already in mainline or already reach the LLM via concrete calls that
+This is the only public-surface change in the port. All other fork methods
+are either already in mainline or reach the LLM via concrete calls that
 `HybridLLM` proxies cleanly.
 
-### Files to create (5)
+### Files to create (6)
 
 | File | Purpose | LOC (fork) |
 | --- | --- | --- |
-| `src/llm-types.ts` | Shared types — `LLM` interface, `EmbeddingResult`, `GenerateResult`, `RerankResult`, `ModelInfo`, options, etc. Fork has 171 lines; mainline can keep most as-is but trim `tokenize`/`detokenize` to concrete-only. | 171 |
+| `src/llm-types.ts` | Shared types — `LLM` interface (9 methods), `EmbeddingResult`, `GenerateResult`, `RerankResult`, `ModelInfo`, options, etc. | 171 |
 | `src/remote-llm.ts` | `RemoteLLM implements LLM`. fetch-based `/embeddings` and `@mariozechner/pi-ai` `complete()` for chat; listwise rerank with batch-15 prompt. | 423 |
 | `src/hybrid-llm.ts` | `HybridLLM implements LLM`. Routes per operation, falls back to local when remote is missing. | 109 |
 | `scripts/debug-config.ts` | `npx tsx scripts/debug-config.ts` prints backend env state. | 32 |
-| `test/remote-llm.test.ts` | Mocks `fetch` and `pi-ai`. Covers all 7 public methods, batch rerank, JSON parse fallbacks, listwise scoring math. | 414 |
-
-`test/hybrid-llm.test.ts` (198 lines, fork) is also brought over — it mocks the
-`LlamaCpp` constructor and asserts routing.
+| `test/remote-llm.test.ts` | Mocks `fetch` and `pi-ai`. Covers all 9 public methods, batch rerank, JSON parse fallbacks, listwise scoring math. | 414 |
+| `test/hybrid-llm.test.ts` | Mocks the `LlamaCpp` constructor. Asserts routing to local / remote / fallback, `modelExists` checks both backends, `getDeviceInfo` returns local info. | 198 |
 
 ### Files to modify (7)
 
@@ -280,8 +279,12 @@ Fork adds `QMD_DEBUG_RERANK` instrumentation in `src/store.ts`'s `rerank()` and
 ### Step-by-step port plan
 
 1. **Branch & scaffold** (10 min)
-   - Branch: `docs/qmd-remote-llm-port` off mainline `main`.
-   - Add `docs/qmd-remote-llm-port.md` (this file).
+   - Branch: `feat/qmd-remote-llm-port` off mainline `main` (this is an
+     implementation branch, not a docs branch — the spec already lives on
+     `docs/qmd-remote-llm-sdd-spec`).
+   - Add `docs/qmd-remote-llm-port.md` (this file, from the docs branch — bring
+     it across with `git checkout docs/qmd-remote-llm-sdd-spec -- docs/qmd-remote-llm-port.md`
+     or copy contents).
    - `mkdir -p scripts/`.
 
 2. **Extract types into `src/llm-types.ts`** (45 min)
@@ -399,7 +402,7 @@ Fork adds `QMD_DEBUG_RERANK` instrumentation in `src/store.ts`'s `rerank()` and
       commit if the MR is small enough to review as a unit. Recommendation:
       **squash** because the layers have non-trivial interdependencies that read
       better as a single change.
-    - Branch: `docs/qmd-remote-llm-port` (per the prior Coda run convention).
+    - Branch: `feat/qmd-remote-llm-port` (per step 1).
     - Push to `alauer/qmd.git`. Open MR against `main` with this spec document
       linked in the description.
 
@@ -446,7 +449,12 @@ npm run test:package
 
 # 4. With NO env vars (default local path) — must behave identically to pre-port
 unset QMD_REMOTE_API_KEY
-npm run test:eval
+npm run test:unit       # vitest + bun on test/ (covers eval-style assertions)
+npm run test:package    # smoke test the built package
+# `npm run test:eval` does not exist in mainline; the closest equivalent is
+# `test:unit` (which runs every vitest + bun test under test/, including any
+# eval-style corpora). Behavioural parity on the test corpora is enforced by
+# S1 + S2 in the success criteria.
 
 # 5. With an Ollama container running (full remote path)
 docker run -d -p 11434:11434 --name ollama-test ollama/ollama
@@ -513,32 +521,73 @@ kill -TERM $PID
   1536-d) require `qmd embed -f`; this is the same constraint that exists today
   if you swap local models. Documented in README.
 
-### Open questions (decide before merging)
+### Decisions (locked before merging)
 
-- **O1. Where do `tokenize` / `detokenize` live?** Two options:
-  - **(a)** Widen `LLM` to 9 methods (current proposal). Cleaner interface; tiny
-    surface change.
-  - **(b)** Keep `LLM` at 6 methods; in `chunkDocumentByTokens`, special-case
-    `HybridLLM` to recurse into `.local.tokenize(...)`. Narrower surface but
-    more `instanceof` checks.
-  - **Recommendation:** (a). It's the fork's choice, the tests support it, and
-    it makes `HybridLLM` a true `LLM` rather than a partial duck-type.
-- **O2. Should `RemoteLLM` be exportable to power users?** Today it's only
-  constructed by `getDefaultLLM()`. Fork doesn't export the class. Consider
-  exporting `RemoteLLM` and `HybridLLM` from the package entrypoint (`src/index.ts`)
-  so advanced users can construct their own compositions. **Recommendation:**
-  export both; they're additive and the cost of exporting is zero.
-- **O3. Rerank default.** When `QMD_REMOTE_RERANK_MODEL` is unset but a remote
-  API key is present, the fork uses local Qwen3 for reranking. That's the right
-  default — listwise LLM rerank is a quality regression on most small chat
-  models. Keep this. **Confirmed.**
-- **O4. Should `scripts/debug-config.ts` be wired into `npm run debug:config`?**
-  Fork doesn't wire it. **Recommendation:** wire it in `package.json` under
-  `scripts.debug-config` so the user can `npm run debug-config`. Cosmetic.
+- **D1. `LLM` interface width.** **9 methods** — current 6 + `embedBatch` +
+  `tokenize` + `detokenize`. `getDeviceInfo` stays concrete-only on
+  `LlamaCpp` and `HybridLLM`. See the *Interface shape* section above for
+  the full rationale. The interface in `src/llm-types.ts` must be exactly
+  these 9 signatures; the implementation worker should not introduce
+  additional methods (no `complete`, no `stream`, no `countTokens`).
+- **D2. Public exports.** `RemoteLLM` and `HybridLLM` are exported from
+  `src/index.ts` so advanced users can construct their own compositions.
+  Cost of exporting is zero; benefit is real (lets users wire remote + local
+  per call without going through env vars).
+- **D3. Rerank default.** When `QMD_REMOTE_RERANK_MODEL` is unset but a
+  remote API key is present, rerank defaults to **local Qwen3**. Listwise
+  LLM rerank is a quality regression on most small chat models; this is
+  the right conservative default.
+- **D4. Debug-config script wiring.** Add a `package.json` script
+  `debug-config` that runs `tsx scripts/debug-config.ts` so users can
+  `npm run debug-config` (or `pnpm run debug-config`). Cosmetic, but
+  cheap.
+
+### Implementation contract & guardrail
+
+This document is the **binding contract** for the implementation worker. The
+implementation branch (`feat/qmd-remote-llm-port`) MUST satisfy every section
+above as written. Specifically:
+
+1. **No invention beyond the spec.** If the implementation worker needs a new
+   file, a new env var, a new `LLM` method, a new dep, or a schema change
+   that is not listed in *Files to create (6)*, *Files to modify (7)*,
+   *Configuration surface*, or *Compatibility with current mainline interfaces*,
+   it must **block** the task and surface the discrepancy here, not patch the
+   spec in passing.
+2. **Repo evidence wins on conflict.** If mainline has moved between this
+   spec's reference HEAD (`e428df7`, v2.6.3) and the implementation branch's
+   tip — e.g. a line number referenced in *Step-by-step port plan* no longer
+   matches, a symbol was renamed, or a function was extracted — the worker
+   must verify by `grep` / `rg` against the live tree, then either:
+   - apply the change against the live code (and call out the diff in the MR
+     description), or
+   - **block** the task if the divergence is non-trivial (e.g. the LLM
+     interface has already been widened, a method is gone, or a call site
+     has been removed entirely).
+3. **Ambiguity is a blocker, not a guess.** Any wording in this spec that the
+   worker cannot resolve in 5 minutes of code reading must trigger
+   `kanban_block`, not silent interpretation. Examples that should block:
+   "does the rerank path use a separate `ILLMSession`?" (not specified —
+   block), "should `withLLMSession` close over a `RemoteLLM`? (yes for
+   `embed`, but `rerank` may not need one — block).
+4. **One final interface.** Do not introduce a temporary 6-method `LLM`
+   interface with the intent of widening to 9 in a follow-up. Land the 9-method
+   interface on the first commit. The diff is small enough.
+5. **Tests are part of the contract.** The two test files listed in *Files to
+   create (6)* are not optional. If a ported test cannot be made to pass
+   against the live mainline tree, the worker must block — do not delete or
+   `.skip` failing cases to make CI green.
+6. **No drive-by edits.** Do not reformat unrelated code, bump deps beyond
+   the two listed in *Files to modify (7)*, or change the mainline version
+   number. If a cleanup is genuinely needed, do it in a separate commit on a
+   separate branch.
+7. **Spec path stays at `docs/qmd-remote-llm-port.md`.** Do not move it to
+   `docs/specs/`. The mainline `.gitignore` is permissive about `docs/*.md`
+   and the existing location is discoverable from the repo root.
 
 ### Acceptance checklist (for MR review)
 
-- [ ] All 5 new files present and reviewed.
+- [ ] All 6 new files present and reviewed.
 - [ ] All 7 modified files compile under `tsc --noEmit`.
 - [ ] `vitest` green on `test/` (existing + 612 lines of new tests).
 - [ ] `bun test` green on `test/`.
