@@ -6,12 +6,15 @@
 
 - Remote LLM backend via `HybridLLM` — route embeddings, query expansion, and reranking to any OpenAI-compatible API
 - 12 new env vars for remote backend configuration
+- `QMD_REMOTE_REASONING_EFFORT` (default `minimal`) — controls the `reasoning_effort` field sent to the remote model so reasoning-capable models (e.g. `minimax-m3`) keep enough output budget to actually answer instead of burning it on internal thinking
 - `debug-config` script for backend diagnostics
 - `QMD_DEBUG_RERANK` for rerank pipeline inspection
 
 ### Changed
 
 - LLM interface widened from 6 to 9 methods (adds `embedBatch`, `tokenize`, `detokenize`)
+- Rerank `maxTokens` budget raised to a 2000-token floor (was `batch.length * 10 + 50`) so reasoning-capable models have headroom for the thinking block plus the JSON array
+- When any rerank batch silently falls back to neutral 0.5 scores, a single `[qmd:rerank] WARNING:` line is now emitted to stderr (previously silent unless `QMD_DEBUG_RERANK=1`)
 
 ### Notes
 

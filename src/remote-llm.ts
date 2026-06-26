@@ -30,11 +30,27 @@ export type RemoteLLMConfig = {
   embedModel?: string;
   generateModel?: string;
   rerankModel?: string;
+  /**
+   * Reasoning effort level for chat completions. Maps to pi-ai's
+   * `reasoning?: ThinkingLevel` which is then translated by pi-ai's
+   * openai-completions path to `reasoning_effort: <level>` (or
+   * `enable_thinking: boolean` for zai/qwen compat providers).
+   *
+   * Use "minimal" to keep reasoning tokens low so the model has budget to
+   * actually answer. Reasoning-capable models (e.g. minimax-m3) otherwise
+   * spend the entire `max_tokens` budget on internal reasoning and return
+   * empty `text` content.
+   *
+   * Default: "minimal". Set to "off" / "none" / "" to disable reasoning
+   * entirely (pi-ai will omit the `reasoning` option).
+   */
+  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "off" | "none" | "";
   timeoutMs?: number;
 };
 
 const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_TIMEOUT_MS = 60000;
+const DEFAULT_REASONING_EFFORT = "minimal";
 
 export class RemoteLLM implements LLM {
   private apiKey: string;
@@ -42,6 +58,7 @@ export class RemoteLLM implements LLM {
   private embedModel: string;
   private generateModel: string;
   private rerankModel?: string;
+  private reasoningEffort: string;
   private timeoutMs: number;
 
   constructor(config: RemoteLLMConfig) {
@@ -54,6 +71,7 @@ export class RemoteLLM implements LLM {
     this.embedModel = config.embedModel || "text-embedding-3-small";
     this.generateModel = config.generateModel || "openai/gpt-3.5-turbo";
     this.rerankModel = config.rerankModel;
+    this.reasoningEffort = config.reasoningEffort ?? DEFAULT_REASONING_EFFORT;
     this.timeoutMs = config.timeoutMs || DEFAULT_TIMEOUT_MS;
   }
 
@@ -142,6 +160,14 @@ export class RemoteLLM implements LLM {
    * For any non-OpenAI base URL (OpenRouter, Ollama, etc.), skip pi-ai's
    * model registry entirely — it only knows about built-in providers.
    * Always return a custom OpenAI-compatible model object.
+   *
+   * `reasoning: true` is set so pi-ai is willing to emit
+   * `reasoning_effort: <level>` (or `enable_thinking: boolean` for zai/qwen
+   * compat providers). Without this flag, the buildParams gate
+   * `if (options?.reasoningEffort && model.reasoning && ...)` never fires
+   * and the user's reasoning preference is silently dropped. Reasoning
+   * effort itself is controlled per-call by the caller via the `reasoning`
+   * option to `complete()`; this just gates whether the option is sent.
    */
   private resolvePiModel(modelStr: string): Model<any> {
     let provider = "openai";
@@ -163,6 +189,7 @@ export class RemoteLLM implements LLM {
         input: ["text"],
         contextWindow: 128000,
         maxTokens: 4096,
+        reasoning: true,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       } as any;
     }
@@ -170,10 +197,28 @@ export class RemoteLLM implements LLM {
     return getModel(provider as any, modelId);
   }
 
+  /**
+   * Build the `reasoning` option to pass to pi-ai's `complete()` based on
+   * the configured `reasoningEffort`. pi-ai accepts `"minimal" | "low" |
+   * "medium" | "high" | "xhigh"` and maps it to `reasoning_effort` (or
+   * `enable_thinking: boolean` for zai/qwen compat). Returning `undefined`
+   * tells pi-ai to omit the field entirely (true "no reasoning" for
+   * providers that distinguish "no effort" from "minimal effort").
+   */
+  private buildReasoningOption(): { reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" } {
+    const r = this.reasoningEffort;
+    if (!r || r === "off" || r === "none" || r === "") return {};
+    if (r === "minimal" || r === "low" || r === "medium" || r === "high" || r === "xhigh") {
+      return { reasoning: r };
+    }
+    // Unknown value: be safe, default to minimal
+    return { reasoning: "minimal" };
+  }
+
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
     const modelStr = options.model || this.generateModel;
     const debugLines: string[] = [];
-    debugLines.push(`[generate] model: ${modelStr} baseURL: ${this.baseURL}`);
+    debugLines.push(`[generate] model: ${modelStr} baseURL: ${this.baseURL} reasoningEffort: ${this.reasoningEffort}`);
     try {
       const model = this.resolvePiModel(modelStr);
       debugLines.push(`[generate] resolved → api: ${model.api}  provider: ${model.provider}  reasoning: ${(model as any).reasoning ?? "?"}  baseUrl: ${model.baseUrl}`);
@@ -186,6 +231,7 @@ export class RemoteLLM implements LLM {
         apiKey: this.apiKey,
         maxTokens: options.maxTokens,
         temperature: options.temperature,
+        ...this.buildReasoningOption(),
       });
 
       debugLines.push(`[generate] stopReason: ${response.stopReason}`);
@@ -299,6 +345,10 @@ JSON Response:`;
     const BATCH_SIZE = 15;
     const chunkChars = options.chunkChars ?? parseInt(process.env.QMD_RERANK_CHUNK_CHARS || "1200", 10);
     const allScores: number[] = new Array(documents.length).fill(0.5);
+    // Track which batches fell back to neutral 0.5 so we can warn the user
+    // that the reranker is degraded. Per-batch parse failures and empty
+    // responses leave the batch at 0.5; we report them once at the end.
+    let failedBatches = 0;
 
     try {
       for (let batchStart = 0; batchStart < documents.length; batchStart += BATCH_SIZE) {
@@ -332,8 +382,12 @@ ${chunksSection}
 
 Respond with ONLY a JSON array of exactly ${batch.length} scores, e.g. ${exampleScores}`;
 
-        // Budget: each score is at most 6 chars ("0.99, "), plus brackets and a small buffer
-        const maxTokens = batch.length * 10 + 50;
+        // Budget: each score is at most 6 chars ("0.99, "), plus brackets and a small buffer.
+        // Reasoning-capable models (e.g. minimax-m3) need a much larger budget because
+        // they emit a thinking block before the JSON. 2000 leaves headroom for
+        // most reasoning models; the rerank prompt itself is small enough that
+        // cost is bounded.
+        const maxTokens = Math.max(batch.length * 10 + 50, 2000);
 
         if (debugRerank) {
           process.stderr.write(`[rerank:llm] batch ${batchStart / BATCH_SIZE + 1}: ${batch.length} docs, maxTokens=${maxTokens}\n`);
@@ -351,6 +405,7 @@ Respond with ONLY a JSON array of exactly ${batch.length} scores, e.g. ${example
         }
 
         if (!result?.text) {
+          failedBatches++;
           if (debugRerank) process.stderr.write(`[rerank:llm] empty response — leaving batch at 0.5\n`);
           continue;
         }
@@ -362,11 +417,13 @@ Respond with ONLY a JSON array of exactly ${batch.length} scores, e.g. ${example
         try {
           parsed = JSON.parse(jsonStr);
         } catch (parseErr) {
+          failedBatches++;
           if (debugRerank) process.stderr.write(`[rerank:llm] JSON parse failed: ${parseErr}\n`);
           continue;
         }
 
         if (!Array.isArray(parsed) || parsed.length !== batch.length) {
+          failedBatches++;
           if (debugRerank) process.stderr.write(`[rerank:llm] array length mismatch: got ${Array.isArray(parsed) ? parsed.length : typeof parsed}, expected ${batch.length}\n`);
           continue;
         }
@@ -394,6 +451,18 @@ Respond with ONLY a JSON array of exactly ${batch.length} scores, e.g. ${example
         results: documents.map((doc, index) => ({ file: doc.file, score: 0.5, index })),
         model: modelStr,
       };
+    }
+
+    // Surface a single stderr warning if any batch silently fell back to 0.5.
+    // Without this, the user sees the same order as pre-rerank and assumes
+    // rerank is working. Set QMD_DEBUG_RERANK=1 for per-batch diagnostics.
+    if (failedBatches > 0) {
+      const totalBatches = Math.ceil(documents.length / BATCH_SIZE);
+      console.error(
+        `[qmd:rerank] WARNING: ${failedBatches}/${totalBatches} batch(es) returned no parseable scores; ` +
+        `those documents got a neutral 0.5 score and rerank is degraded. ` +
+        `Set QMD_DEBUG_RERANK=1 for per-batch parse diagnostics, or check the remote model response.`,
+      );
     }
 
     const results = documents
