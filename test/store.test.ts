@@ -3458,7 +3458,12 @@ describe("Embedding batching", () => {
   test("generateEmbeddings opens a long-lived LLM session for embed runs", async () => {
     const store = await createTestStore();
     const fakeLlm = createFakeEmbedLlm();
-    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+    // A non-LlamaCpp LLM (HybridLLM/RemoteLLM in production, or this fake)
+    // routes through withLLMSession with the store's LLM passed as the
+    // explicit override — NOT withLLMSessionForLlm, which is reserved for
+    // concrete LlamaCpp instances that need idle-unload reference counting.
+    // See docs/qmd-remote-llm-port-audit-2026-06-26.md §7 (CLI integration).
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSession");
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
     store.llm = fakeLlm as any;
@@ -3469,9 +3474,9 @@ describe("Embedding batching", () => {
       await generateEmbeddings(store);
 
       expect(sessionSpy).toHaveBeenCalledWith(
-        fakeLlm,
         expect.any(Function),
         expect.objectContaining({ maxDuration: 30 * 60 * 1000, name: "generateEmbeddings" }),
+        fakeLlm,
       );
     } finally {
       sessionSpy.mockRestore();

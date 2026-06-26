@@ -23,9 +23,10 @@ import {
   LlamaCpp,
   getDefaultLLM,
   getDefaultLlamaCpp,
+  withLLMSession,
+  withLLMSessionForLlm,
   formatQueryForEmbedding,
   formatDocForEmbedding,
-  withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
@@ -88,13 +89,30 @@ function getLlm(store: Store): LLM {
 }
 
 /**
- * Resolve the embed model name used for prompt formatting. When the store
- * has its own LlamaCpp bound, prefer its `embedModelName` (since
- * embeddinggemma uses different prompt templates than OpenAI's
- * text-embedding-3-small). Otherwise fall back to the local default —
- * HybridLLM/RemoteLLM paths route through `embedBatch(texts)` without
- * needing the model name on the local side, and the format-function does
- * its best with the default.
+ * Resolve the embed model name used for prompt formatting. The model name
+ * is used for two distinct purposes:
+ *   1. `formatQueryForEmbedding` / `formatDocForEmbedding` — different model
+ *      families use different prompt prefixes (embeddinggemma uses a
+ *      title + passage prefix; OpenAI's text-embedding-3-small uses no
+ *      prefix; etc.). Wrong prefix → wrong embeddings even on the right model.
+ *   2. sqlite-vec keying — the model name is stored alongside each vector
+ *      so queries can look up vectors produced by the same model.
+ *
+ * Resolution order (most specific wins):
+ *   1. If the store has its own `LlamaCpp` bound, use its `embedModelName`
+ *      (the local path).
+ *   2. Otherwise, look at the default HybridLLM. If the embed backend is
+ *      "remote" and a remote embed model is configured, return that. This
+ *      matches the model that HybridLLM.embed / embedBatch will actually
+ *      call, so format-prefix and sqlite-vec keying are correct.
+ *   3. Fall back to DEFAULT_EMBED_MODEL (the local embeddinggemma URI).
+ *
+ * This is the right function for callers that care about "what model
+ * did the actual embed get done with" — store.generateEmbeddings uses
+ * it to label sqlite-vec rows, and the CLI uses it for the `Model:` log
+ * line. Callers that need the local URI for actually loading a GGUF
+ * (e.g. the LlamaCpp constructor) should use resolveEmbedModel()
+ * directly so they always get the local model.
  */
 function resolveEmbedModelForStore(store: Store): string {
   if (store.llm) {
@@ -105,6 +123,23 @@ function resolveEmbedModelForStore(store: Store): string {
     // bind as NULL and fail the NOT NULL constraint on content_vectors.model).
     const name = (store.llm as LlamaCpp).embedModelName;
     if (name) return name;
+  }
+  // HybridLLM path: if embed is routed to remote, return the remote model
+  // name so format-prefix + sqlite-vec keying match what's actually used.
+  // We import lazily to avoid a circular import (llm.js imports store types
+  // via the LLM interface, and importing it eagerly here is a no-op in
+  // practice but reads better in one place).
+  const defaultLlm = getDefaultLLM();
+  if (defaultLlm && typeof (defaultLlm as { getLocal?: () => LLM }).getLocal === "function") {
+    const hybrid = defaultLlm as unknown as {
+      config?: { embedBackend?: "local" | "remote" };
+      remote?: { embedModel?: string };
+    };
+    if (hybrid.config?.embedBackend === "remote") {
+      const remoteModel = process.env.QMD_REMOTE_EMBED_MODEL
+        ?? hybrid.remote?.embedModel;
+      if (remoteModel) return remoteModel;
+    }
   }
   return DEFAULT_EMBED_MODEL;
 }
@@ -1726,25 +1761,26 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session.
-  // withLLMSessionForLlm expects a concrete LlamaCpp-shaped instance because
-  // the session manager is LlamaCpp-specific. When we have a real LlamaCpp
-  // we use it directly; when we have a HybridLLM wrapping a LlamaCpp, we
-  // pull the concrete local backend through HybridLLM.getLocal(); for test
-  // doubles that aren't LlamaCpp (e.g. sdk.test.ts uses a plain fake), we
-  // cast the LLM we already have — the session manager only needs the
-  // shape, and the actual embed work goes through the session's embed call
-  // which routes to whichever LLM was bound to the manager.
-  const llm = getLlm(store);
-  const llmCpp: LlamaCpp = llm instanceof LlamaCpp
-    ? llm
-    : typeof (llm as unknown as { getLocal?: () => LLM }).getLocal === "function"
-    ? ((llm as unknown as { getLocal: () => LLM }).getLocal() as LlamaCpp)
-    : (llm as unknown as LlamaCpp);
+  // Use the store's LLM if bound, else the default HybridLLM. The store's
+  // LLM is honored for test-injection (`store.llm = fakeLlm`); the default
+  // HybridLLM is what the CLI uses.
+  //
+  // For HybridLLM/RemoteLLM the session is the thin proxy in
+  // `withLLMSession` (just an AbortSignal + maxDuration timer; no
+  // reference counting — no native model to unload). The thin session
+  // calls `llm.embed()` directly which for HybridLLM dispatches to
+  // the configured backend (remote or local). For a concrete LlamaCpp
+  // (production local-only, or the test-injection fakes that pre-port
+  // code expected to be cast to LlamaCpp), use the full session
+  // manager via `withLLMSessionForLlm`.
   const embedModelUri = model;
+  const llm = getLlm(store);
 
-  // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llmCpp, async (session) => {
+  // The embed loop body, parameterized by the session so the same
+  // code works with both the full session manager (local) and the
+  // thin session (remote). Pulled out so either session wrapper can
+  // run it. Declared first (hoisted regardless) for readability.
+  async function runEmbedBody(session: ILLMSession) {
     let chunksEmbedded = 0;
     let bytesProcessed = 0;
     let totalChunks = 0;
@@ -1965,7 +2001,27 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  }
+
+  // Dispatch to the right session wrapper:
+  //   - Concrete LlamaCpp → full session manager (idle-unload protection,
+  //     reference counting). Covers production local-only and the
+  //     test-injection fakes that pre-port code cast to LlamaCpp.
+  //   - HybridLLM / RemoteLLM → thin session. The thin session's
+  //     embed/embedBatch call `llm.embed()` directly, so HybridLLM's
+  //     dispatch logic actually routes to the configured backend
+  //     (remote or local). The pre-port code forced the inner LlamaCpp
+  //     here, which is why `qmd embed` with QMD_EMBED_BACKEND=remote
+  //     still hit the local GGUF model.
+  const result = llm instanceof LlamaCpp
+    ? await withLLMSessionForLlm(llm, runEmbedBody, {
+        maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS,
+        name: 'generateEmbeddings',
+      })
+    : await withLLMSession(runEmbedBody, {
+        maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS,
+        name: 'generateEmbeddings',
+      }, llm);
 
   return {
     docsProcessed: totalDocs,
@@ -2035,8 +2091,19 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model ?? store.llm?.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, store.llm),
+    //
+    // Pass `undefined` for the model name by default — let each backend
+    // (LlamaCpp or RemoteLLM) use its own configured model. The local
+    // LlamaCpp path uses store.llm?.generateModelName / rerankModelName if
+    // bound, or the default constants. RemoteLLM uses the QMD_REMOTE_*
+    // env vars set at construction. Defaulting to a local GGUF URI here
+    // (the old code) defeats the spec's "no model" rule and would
+    // accidentally hand a HuggingFace `hf:ggml-org/...` URI to the remote
+    // backend (see docs/qmd-remote-llm-port.md §"Rerank model passing —
+    // non-obvious gotcha"). Callers can still pass a model explicitly via
+    // the optional parameter.
+    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent, store.llm),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -2337,12 +2404,11 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
 
   const expectedHashSeq = `${sample.hash}_${sample.seq}`;
   const title = extractTitle(sample.body, sample.path);
-  const llm = getLlm(store);
-  const llmCpp: LlamaCpp = llm instanceof LlamaCpp
-    ? llm
-    : (llm as unknown as { getLocal: () => LLM }).getLocal() as LlamaCpp;
 
-  return await withLLMSessionForLlm(llmCpp, async (session) => {
+  // Use withLLMSession (dispatches to LlamaCpp session manager or thin
+  // HybridLLM/RemoteLLM proxy) so remote embed backend works here too.
+  // Same fix as generateEmbeddings (line 1747).
+  return await withLLMSession(async (session) => {
     const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
     const chunk = chunks[sample.seq];
     if (!chunk) {

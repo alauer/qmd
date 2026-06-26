@@ -226,3 +226,75 @@ failure silent to the user.
 - **remote-llm.test.ts is 419 lines vs spec's 414.** Five-line difference in docstring/header. Acceptable.
 - **SIGINT handler in `src/mcp/server.ts:902` also calls `disposeDefaultLLM`.** Spec only mentioned SIGTERM. Strict improvement.
 - **24 test failures in the full vitest run are all environment-only**, not regressions. Verified by re-running just `test/remote-llm.test.ts test/hybrid-llm.test.ts` — 31/31 pass.
+
+---
+
+## 7. Gap #4 — CLI does not use the remote models (real bug, real fix needed)
+
+**Discovered:** 2026-06-26, post-merge, when Aaron ran `qmd embed` with the full env-var set and got `Model: embeddinggemma-300M-Q8_0.gguf` instead of the configured `perplexity/pplx-embed-v1-0.6b`. The CLI was hitting the local GGUF file even though `QMD_EMBED_BACKEND=remote` and `QMD_REMOTE_API_KEY` were set.
+
+**This invalidates a lot of the previous audit.** The HybridLLM class works (and the live tests confirmed that calling `RemoteLLM` directly hits OpenRouter). But the CLI integration was botched in the original port — `getDefaultLLM()` returns a `HybridLLM`, but the CLI/store never routes embed/expand/rerank through it for the indexing hot path. My prior audit missed this because I read the spec and checked the new files in isolation, never traced the actual call sites in `store.ts` to confirm they go through the HybridLLM. That's an audit failure, not a code one.
+
+### 7.1 What the CLI actually does today
+
+**`qmd embed -c foo` (line 4322 → `vectorIndex` → `generateEmbeddings` in `src/store.ts:1705`):**
+
+```typescript
+const llm = getLlm(store);                                          // = getDefaultLLM() = HybridLLM
+const llmCpp: LlamaCpp = llm instanceof LlamaCpp                     // false
+  ? llm
+  : (llm as { getLocal: () => LLM }).getLocal() as LlamaCpp;         // HybridLLM.getLocal() = the inner LlamaCpp
+
+const result = await withLLMSessionForLlm(llmCpp, async (session) => {
+  // ...
+  const result = await session.embed(text, { model });               // session is bound to LlamaCpp
+  // ...
+});
+```
+
+The session is constructed with the **inner LlamaCpp** (pulled out via `HybridLLM.getLocal()`), not the HybridLLM itself. The session is a LlamaCpp session; `session.embed()` routes through the local GGUF model. The HybridLLM's `getBackend('remote').embed()` is never called. The env vars are loaded, the HybridLLM exists, but it's bypassed.
+
+**`qmd query "..."` (line 2656 → `hybridQuery` in `src/store.ts:4812`):**
+
+- Vector search (`hybridQuery` line 4899): `llm.embedBatch(texts)` where `llm = getLlm(store) = HybridLLM` — **does** route through HybridLLM. Works remote.
+- Rerank (`hybridQuery` line 5030 → `store.rerank` line 2039 → `rerank()` in `src/store.ts:3990`): routes through `getDefaultLLM()` — HybridLLM. Works remote.
+- BUT: `embedModel` (line 4902) is `resolveEmbedModelForStore(store)` which returns `DEFAULT_EMBED_MODEL` (the local URI) when `store.llm` is undefined. This model name is passed to `formatQueryForEmbedding(s.query, embedModel)` which uses the wrong prefix and breaks the embed for vector search.
+
+**`store.rerank` (line 2039) and `store.expandQuery` (line 2038) also have a defaulting bug:**
+
+```typescript
+rerank: (query, documents, model?, intent?) =>
+  rerank(query, documents, model ?? store.llm?.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, store.llm),
+```
+
+The `model` parameter defaults to `store.llm?.rerankModelName ?? DEFAULT_RERANK_MODEL`, which is the local Qwen3 URI (`hf:ggml-org/Qwen3-Reranker-0.6B-...`). This truthy value then defeats the "no model" fix at line 4034 of the rerank function (`rerankOptions: { model?: string } = model ? { model } : {};`). The local URI is passed all the way through to `RemoteLLM.rerank` which uses it as the remote model name. **This is exactly the bug the spec §"Rerank model passing — non-obvious gotcha" warned about.** Same problem on the expand path.
+
+**`maybeAdoptLegacyEmbeddingFingerprint` (line 2345):** same `withLLMSessionForLlm(llmCpp, ...)` pattern. Migration helper, low frequency, but would fail on remote.
+
+### 7.2 Why the prior audit missed this
+
+I read the spec carefully, checked the 6 new files, ran `npm run debug-config` (which showed `LLM Class: HybridLLM` — looked great), checked the LLM interface is widened to 9 methods, ran the 33 new port tests (all pass), and then ran my own `test-live.mjs` which called `RemoteLLM` directly. All that proved the **class** is correct. I never ran `qmd embed` end-to-end with remote env vars set and watched the `Model:` line. If I had, I would have caught this immediately.
+
+This is an audit failure. The right check was: actually invoke the CLI, observe the behavior, confirm it matches the spec. I did the substitute ("look at the code that should be wired up") instead of the verification ("run the code and watch what it does"). The MR title was wrong; "fix(remote-llm): pass reasoning_effort so reasoning-capable models answer" describes a real fix in the fix branch, but the audit doc said the port works end-to-end and that was wrong.
+
+### 7.3 Fix (applied on `fix/remote-llm-reasoning-effort` branch as additional commit)
+
+Three concrete code changes:
+
+1. **`generateEmbeddings` in `src/store.ts` (line 1705)**: when the resolved LLM is a HybridLLM (or anything other than a concrete LlamaCpp), call `llm.embedBatch(texts)` directly instead of `withLLMSessionForLlm`. The session wrapper exists for local-LlamaCpp idle-unload protection; for remote there's no native model to unload. This is the same fix in concept as what the spec §"withLLMSession" called for: "If LlamaCpp: existing session manager. If HybridLLM/RemoteLLM: thin ILLMSession proxy" — the createThinSession path exists in `withLLMSession` (line 1882) and is what HybridLLM callers should use. The store's `generateEmbeddings` was using the wrong branch.
+
+2. **`resolveEmbedModelForStore` in `src/store.ts` (line 99)**: return the remote model name when the HybridLLM is configured for remote embed, else the local LlamaCpp's `embedModelName`, else `DEFAULT_EMBED_MODEL`. The model name is used for `formatQueryForEmbedding` / `formatDocForEmbedding` (different model families use different prefixes) and for sqlite-vec keying. Same fix for the CLI side at `resolveEmbedModelForCli` in `src/cli/qmd.ts:1851`.
+
+3. **`store.rerank` (line 2039) and `store.expandQuery` (line 2038)**: pass `undefined` (not the default model) as the `model` parameter to the underlying functions. This activates the "no model" fix in the rerank function (line 4034) which already exists and was just being bypassed by the defaulting.
+
+### 7.4 Verification
+
+After the fix, the manual test procedure in the audit doc's "What to do next" section must show `qmd embed` actually calling OpenRouter (log line: `Model: perplexity/pplx-embed-v1-0.6b`, and the live OpenRouter call visible in the key usage). The prior manual test (steps 1–9) used local model output even with remote env vars set, because the CLI was bypassing HybridLLM.
+
+### 7.5 What changes in the audit doc
+
+The "Compliance matrix" above says all G1–G7 are satisfied. That's true at the class level, false at the CLI integration level. The fix branch (`fix/remote-llm-reasoning-effort`) does not address the CLI integration in its first commit. A second commit on the same branch addresses it. The audit doc's compliance matrix needs an asterisk: G1 is satisfied for `HybridLLM.embed()` direct calls but not for the CLI `qmd embed` path until the second commit lands.
+
+### 7.6 Process notes (for future Coda sessions)
+
+**What to do differently next time:** when the user says "test the CLI", actually invoke the CLI, set the env vars, run the command, observe the actual output. Don't substitute "the code looks right" for "the code works." The audit doc's "Audit method" section should be updated to require end-to-end CLI invocation as step 0, not just class-level inspection.
