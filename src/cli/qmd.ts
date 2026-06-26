@@ -129,6 +129,29 @@ let store: ReturnType<typeof createStore> | null = null;
 let storeDbPathOverride: string | undefined;
 let currentIndexName = "index";
 
+/**
+ * Heuristic: is `model` a LOCAL GGUF model URI (loadable by node-llama-cpp)
+ * rather than a remote API model slug?
+ *
+ * Local forms: `hf:org/repo/file.gguf`, absolute/relative paths, anything
+ * ending in `.gguf`. Remote forms are bare provider slugs like
+ * `perplexity/pplx-embed-v1-0.6b` or `minimax/minimax-m3` (no `hf:` prefix,
+ * no `.gguf`, no path separators beyond the single provider/model slash).
+ *
+ * Used by getStore() to ensure the local LlamaCpp is never handed a remote
+ * model name (which it would try to load as a GGUF file and fail). When the
+ * remote backend is configured, the local LlamaCpp still backs local-only
+ * roles like tokenization, so it must keep a valid local model URI.
+ * See docs/qmd-remote-llm-port-audit-2026-06-26.md §7.
+ */
+function isLocalModelUri(model: string | undefined): boolean {
+  if (!model) return false;
+  if (model.startsWith("hf:")) return true;
+  if (model.endsWith(".gguf")) return true;
+  if (model.startsWith("/") || model.startsWith("./") || model.startsWith("~")) return true;
+  return false;
+}
+
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
@@ -137,10 +160,23 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
+      // The local LlamaCpp must always be constructed with LOCAL model URIs.
+      // When a remote backend is configured (QMD_*_BACKEND=remote), the
+      // persisted config / active models may carry a remote model name
+      // (e.g. "perplexity/pplx-embed-v1-0.6b"). The local LlamaCpp can't
+      // load that as a GGUF, and it's still needed for local-only roles
+      // (notably tokenizeBackend defaults to "local", and chunking uses
+      // the local tokenizer). Sanitize each role: if the configured model
+      // isn't a local GGUF path/URI, fall back to the local default.
+      // The HybridLLM wrapper routes the actual remote work to RemoteLLM.
+      // See docs/qmd-remote-llm-port-audit-2026-06-26.md §7.
+      const localEmbed = isLocalModelUri(activeModels.embed) ? activeModels.embed : DEFAULT_EMBED_MODEL;
+      const localGenerate = isLocalModelUri(activeModels.generate) ? activeModels.generate : resolveGenerateModel();
+      const localRerank = isLocalModelUri(activeModels.rerank) ? activeModels.rerank : resolveRerankModel();
       setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
+        embedModel: localEmbed,
+        generateModel: localGenerate,
+        rerankModel: localRerank,
       }));
     } catch {
       // Config may not exist yet — that's fine, DB works without it
@@ -1849,6 +1885,15 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
 }
 
 export function resolveEmbedModelForCli(): string {
+  // The CLI's `Model:` log line and the vector-table keying need to
+  // match what HybridLLM.embed / embedBatch actually call. When the
+  // remote embed backend is configured, that's the remote model
+  // (QMD_REMOTE_EMBED_MODEL); otherwise the local URI.
+  // See docs/qmd-remote-llm-port-audit-2026-06-26.md §7.
+  if (process.env.QMD_REMOTE_API_KEY && process.env.QMD_EMBED_BACKEND !== "local") {
+    const remote = process.env.QMD_REMOTE_EMBED_MODEL;
+    if (remote) return remote;
+  }
   return ensureModelsConfiguredForCli().embed;
 }
 
@@ -3971,6 +4016,9 @@ function printDoctorHint(): void {
 }
 
 function exitWithError(error: unknown, code = 1): never {
+  if (process.env.QMD_DEBUG_STACK) {
+    console.error(error instanceof Error ? error.stack : String(error));
+  }
   console.error(error instanceof Error ? error.message : String(error));
   printDoctorHint();
   process.exit(code);

@@ -10,11 +10,18 @@
 - `debug-config` script for backend diagnostics
 - `QMD_DEBUG_RERANK` for rerank pipeline inspection
 
+### Fixed
+
+- **CLI integration for the remote backend.** `qmd embed` and `qmd query` previously ignored `QMD_EMBED_BACKEND=remote` and always ran embeddings through the local LlamaCpp model — the remote port worked at the class level but never through the CLI. Three causes were fixed: (1) `generateEmbeddings` forced the inner LlamaCpp session via `withLLMSessionForLlm` even when a HybridLLM was configured; it now routes through `withLLMSession` so HybridLLM dispatches embed/embedBatch to the configured backend; (2) `resolveEmbedModelForCli` / `resolveEmbedModelForStore` now return the remote model name (and tag sqlite-vec rows with it) when the remote embed backend is active, while `resolveEmbedModel` still returns the local GGUF URI for the LlamaCpp constructor; (3) the local LlamaCpp built in `getStore()` is now sanitized so a remote model slug in persisted config can't be handed to node-llama-cpp as a GGUF path (the local model is still needed for tokenization, since `tokenizeBackend` defaults to `local`)
+- `store.rerank` / `store.expandQuery` no longer default the model argument to a local GGUF URI, which previously leaked a `hf:ggml-org/...` path into the remote rerank/expand calls
+
 ### Changed
 
 - LLM interface widened from 6 to 9 methods (adds `embedBatch`, `tokenize`, `detokenize`)
 - Rerank `maxTokens` budget raised to a 2000-token floor (was `batch.length * 10 + 50`) so reasoning-capable models have headroom for the thinking block plus the JSON array
 - When any rerank batch silently falls back to neutral 0.5 scores, a single `[qmd:rerank] WARNING:` line is now emitted to stderr (previously silent unless `QMD_DEBUG_RERANK=1`)
+- `withLLMSession` accepts an optional explicit LLM override so a store-bound LLM (`store.llm`) is honored instead of always using the process-wide default
+- `QMD_DEBUG_STACK=1` prints the full stack trace on CLI errors (opt-in diagnostic; zero cost when unset)
 
 ### Notes
 

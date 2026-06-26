@@ -223,6 +223,21 @@ export type ModelResolutionConfig = {
 };
 
 export function resolveEmbedModel(config?: ModelResolutionConfig): string {
+  // This is used by:
+  //   1. The LlamaCpp constructor (line 664) to pick the GGUF model URI
+  //      to load eagerly. MUST return the local URI always — the LlamaCpp
+  //      can't load a remote model. So the QMD_EMBED_BACKEND=remote case
+  //      is handled here by NOT returning a remote model name; the
+  //      HybridLLM wrapper takes care of routing.
+  //   2. The formatQueryForEmbedding / formatDocForEmbedding functions
+  //      (lines 122, 135), which use the model name for prompt
+  //      formatting. These accept a model name as an argument; if no
+  //      model is passed, they fall through to resolveEmbedModel() and
+  //      get the local URI.
+  //
+  // For the CLI's `Model:` log line and the vector-table keying, see
+  // resolveEmbedModelForCli in src/cli/qmd.ts (which DOES return the
+  // remote model name when QMD_EMBED_BACKEND=remote).
   return config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
 }
 
@@ -1861,9 +1876,14 @@ function getSessionManager(): LLMSessionManager {
  */
 export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
-  options?: LLMSessionOptions
+  options?: LLMSessionOptions,
+  llmOverride?: LLM,
 ): Promise<T> {
-  const llm = getDefaultLLM();
+  // Callers may pass an explicit LLM (e.g. a store's injected `store.llm`,
+  // or a test fake). When omitted, fall back to the process-wide default
+  // HybridLLM. This lets generateEmbeddings honor a store-bound LLM while
+  // still routing HybridLLM/RemoteLLM through their own dispatch logic.
+  const llm = llmOverride ?? getDefaultLLM();
 
   if (llm instanceof LlamaCpp) {
     // Existing path: full session manager with idle-unload protection.
