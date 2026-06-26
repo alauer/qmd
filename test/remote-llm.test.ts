@@ -416,4 +416,145 @@ describe("RemoteLLM", () => {
     expect(result).toHaveLength(1);
     expect(result[0]!.type).toBe("vec");
   });
+
+  // -------------------------------------------------------------------------
+  // reasoningEffort pass-through (gap #1 fix)
+  // -------------------------------------------------------------------------
+
+  it("should default reasoningEffort to 'minimal' and pass it to pi-ai", async () => {
+    const mockModel = { id: "minimax/minimax-m3", api: "openai-completions" };
+    (piAi.getModel as any).mockReturnValue(mockModel);
+    (piAi.complete as any).mockResolvedValue({
+      content: [{ type: "text", text: "pong" }]
+    });
+
+    // Default RemoteLLM with no reasoningEffort specified.
+    const def = new RemoteLLM(config);
+    await def.generate("Reply with pong");
+
+    expect(piAi.complete).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ reasoning: "minimal" }),
+    );
+  });
+
+  it("should pass an explicit reasoningEffort to pi-ai's complete()", async () => {
+    const mockModel = { id: "openai/o1", api: "openai-completions" };
+    (piAi.getModel as any).mockReturnValue(mockModel);
+    (piAi.complete as any).mockResolvedValue({
+      content: [{ type: "text", text: "answer" }]
+    });
+
+    const llmLow = new RemoteLLM({ ...config, reasoningEffort: "low" });
+    await llmLow.generate("hi");
+
+    expect(piAi.complete).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ reasoning: "low" }),
+    );
+  });
+
+  it("should omit the reasoning option when reasoningEffort is 'off'", async () => {
+    const mockModel = { id: "openai/o1", api: "openai-completions" };
+    (piAi.getModel as any).mockReturnValue(mockModel);
+    (piAi.complete as any).mockResolvedValue({
+      content: [{ type: "text", text: "answer" }]
+    });
+
+    const llmOff = new RemoteLLM({ ...config, reasoningEffort: "off" });
+    await llmOff.generate("hi");
+
+    const lastCall = (piAi.complete as any).mock.calls.at(-1);
+    const opts = lastCall?.[2] ?? {};
+    expect(opts).not.toHaveProperty("reasoning");
+  });
+
+  it("should set reasoning: true on the synthesized pi-ai model for non-OpenAI base URLs", async () => {
+    // Non-OpenAI baseURL triggers the synthesized model object path in
+    // resolvePiModel(). The synthesized model must have `reasoning: true`
+    // so pi-ai's buildParams gate (`model.reasoning && ...`) actually emits
+    // the `reasoning_effort` field on the wire.
+    (piAi.complete as any).mockResolvedValue({
+      content: [{ type: "text", text: "pong" }]
+    });
+
+    await llm.generate("hi"); // `llm` uses config.baseURL = api.example.com/v1
+
+    const lastCall = (piAi.complete as any).mock.calls.at(-1);
+    const modelArg = lastCall?.[0];
+    expect(modelArg).toMatchObject({ reasoning: true });
+  });
+
+  // -------------------------------------------------------------------------
+  // rerank failed-batch warning (gap #2 fix)
+  // -------------------------------------------------------------------------
+
+  it("should warn to stderr when any rerank batch silently falls back to 0.5", async () => {
+    (piAi.complete as any).mockResolvedValue({
+      content: [{ type: "text", text: "" }]  // empty text → silent 0.5 fallback
+    });
+
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const docs = [
+        { file: "a.md", text: "alpha" },
+        { file: "b.md", text: "beta" },
+      ];
+      const result = await llm.rerank("q", docs);
+
+      // All scores should be 0.5 since the response was empty.
+      expect(result.results.every((r) => r.score === 0.5)).toBe(true);
+      // And a stderr warning should have fired.
+      expect(stderrSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[qmd:rerank] WARNING"),
+      );
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("should NOT warn to stderr when all rerank batches parse successfully", async () => {
+    (piAi.complete as any).mockResolvedValue({
+      content: [{ type: "text", text: "[0.9, 0.1]" }]
+    });
+
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const docs = [
+        { file: "a.md", text: "alpha" },
+        { file: "b.md", text: "beta" },
+      ];
+      const result = await llm.rerank("q", docs);
+
+      expect(result.results).toHaveLength(2);
+      expect(stderrSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("[qmd:rerank] WARNING"),
+      );
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("should bump rerank maxTokens to 2000 (or batch*10+50, whichever is larger) to fit reasoning blocks", async () => {
+    // Mock complete to capture the maxTokens option that rerank passes.
+    let capturedMaxTokens: number | undefined;
+    (piAi.complete as any).mockImplementation(async (_model: any, _ctx: any, opts: any) => {
+      capturedMaxTokens = opts?.maxTokens;
+      return { content: [{ type: "text", text: "[0.5]" }] };
+    });
+
+    // A 3-doc batch would previously get maxTokens = 30 + 50 = 80, which is
+    // too small for a reasoning-capable model. New floor: 2000.
+    const docs = [
+      { file: "a.md", text: "alpha" },
+      { file: "b.md", text: "beta" },
+      { file: "c.md", text: "gamma" },
+    ];
+    await llm.rerank("q", docs);
+
+    expect(capturedMaxTokens).toBeDefined();
+    expect(capturedMaxTokens).toBeGreaterThanOrEqual(2000);
+  });
 });

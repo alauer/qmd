@@ -2114,6 +2114,12 @@ export function getDefaultLLM(): LLM {
         embedModel: process.env.QMD_REMOTE_EMBED_MODEL,
         generateModel: process.env.QMD_REMOTE_GENERATE_MODEL,
         rerankModel: process.env.QMD_REMOTE_RERANK_MODEL || undefined,
+        // QMD_REMOTE_REASONING_EFFORT: maps to pi-ai's `reasoning` option and
+        // then to `reasoning_effort` (or `enable_thinking`) on the wire.
+        // Defaults to "minimal" inside RemoteLLM when unset.
+        reasoningEffort: process.env.QMD_REMOTE_REASONING_EFFORT as
+          | "minimal" | "low" | "medium" | "high" | "xhigh" | "off" | "none" | ""
+          | undefined,
         timeoutMs: process.env.QMD_REMOTE_TIMEOUT
           ? parseInt(process.env.QMD_REMOTE_TIMEOUT, 10)
           : undefined,

@@ -1216,12 +1216,13 @@ QMD_RERANK_BACKEND="remote"
 | `QMD_REMOTE_GENERATE_MODEL` | `openai/gpt-3.5-turbo` | Generation/query-expansion model on the remote API |
 | `QMD_REMOTE_RERANK_MODEL` | — | Rerank model on the remote API; falls back to `QMD_REMOTE_GENERATE_MODEL` if unset |
 | `QMD_REMOTE_TIMEOUT` | `60000` | Remote request timeout in ms |
+| `QMD_REMOTE_REASONING_EFFORT` | `minimal` | Reasoning effort sent to the remote model (`minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `off` \| `none`). `minimal` is the safe default for reasoning-capable models (e.g. `minimax-m3`) so they don't burn the output budget on internal thinking. `off`/`none` omits the field entirely. |
 | `QMD_EMBED_BACKEND` | `remote` if key set, else `local` | `local` or `remote` |
 | `QMD_GENERATE_BACKEND` | `remote` if key set, else `local` | `local` or `remote` |
 | `QMD_RERANK_BACKEND` | `remote` if `QMD_REMOTE_RERANK_MODEL` set, else `local` | `local` or `remote` |
 | `QMD_TOKENIZE_BACKEND` | `local` | `local` or `remote` |
 | `QMD_RERANK_CHUNK_CHARS` | `1200` | Max characters of each chunk sent to the remote reranker |
-| `QMD_DEBUG_RERANK` | — | Set to `1` to print rerank prompt, response, and score changes to stderr |
+| `QMD_DEBUG_RERANK` | — | Set to `1` to print rerank prompt, response, and score changes to stderr. A summary warning is also emitted to stderr whenever any rerank batch silently falls back to neutral 0.5 scores. |
 
 ## How It Works
 
