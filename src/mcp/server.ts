@@ -74,6 +74,38 @@ function encodeQmdPath(path: string): string {
 }
 
 /**
+ * Decode a lookup value that may be a percent-encoded qmd:// URI.
+ *
+ * Search/get/multi_get results hand back URIs built with encodeQmdPath()
+ * (e.g. `qmd://docs/my%20notes.md`). When the LLM feeds one of those URIs
+ * straight back into the `get` / `multi_get` TOOLS, the value is still
+ * percent-encoded — but store.findDocument() matches it with an EXACT
+ * string comparison against the raw `qmd://collection/path`, so the encoded
+ * form misses and the tool returns "not found" / empty. The CLI `qmd get`
+ * works because users type the raw (unencoded) path.
+ *
+ * Decode per-segment so we reverse exactly what encodeQmdPath did, and only
+ * for `qmd://` inputs — bare relative paths, absolute paths, and docids
+ * (#abc123) are passed through untouched. Decoding is best-effort: a
+ * malformed escape (decodeURIComponent throws) leaves that segment as-is.
+ */
+function decodeQmdLookup(value: string): string {
+  if (!value.startsWith('qmd://')) return value;
+  const rest = value.slice('qmd://'.length);
+  const decoded = rest
+    .split('/')
+    .map(segment => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    })
+    .join('/');
+  return `qmd://${decoded}`;
+}
+
+/**
  * Format search results as human-readable text summary
  */
 function formatSearchSummary(results: SearchResultItem[], query: string): string {
@@ -424,6 +456,15 @@ Intent-aware lex (C++ performance, not sports):
       }
       if (parsedFromLine !== undefined) parsedFromLine = Math.max(1, parsedFromLine);
 
+      // The `file` value often comes straight from a prior search/get result,
+      // whose qmd:// URIs are percent-encoded by encodeQmdPath (e.g.
+      // `qmd://docs/my%20notes.md`). store.get() matches qmd:// URIs with an
+      // exact string comparison against the RAW path, so the encoded form
+      // misses and returns "not found" / empty. Decode it back to the raw
+      // path before lookup. Non-qmd:// values (relative/absolute paths,
+      // docids) pass through untouched.
+      lookup = decodeQmdLookup(lookup);
+
       const result = await store.get(lookup, { includeBody: false });
 
       if ("error" in result) {
@@ -482,7 +523,15 @@ Intent-aware lex (C++ performance, not sports):
       },
     },
     async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
-      const { docs, errors } = await store.multiGet(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
+      // A comma-separated list may contain percent-encoded qmd:// URIs copied
+      // from search/get results (see decodeQmdLookup). Decode each qmd:// entry
+      // back to its raw path so multiGet's path matching succeeds; glob
+      // patterns and bare paths are left untouched.
+      const decodedPattern = pattern
+        .split(',')
+        .map(part => decodeQmdLookup(part.trim()))
+        .join(',');
+      const { docs, errors } = await store.multiGet(decodedPattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
 
       if (docs.length === 0 && errors.length === 0) {
         return {
