@@ -67,6 +67,11 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  setDefaultLlamaCpp,
+  getDefaultLLM,
+  resolveGenerateModel,
+  resolveRerankModel,
+  DEFAULT_EMBED_MODEL_URI,
 } from "./llm.js";
 import { RemoteLLM } from "./remote-llm.js";
 import { HybridLLM, type LLMBackend, type HybridLLMConfig } from "./hybrid-llm.js";
@@ -376,14 +381,73 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
+  //
+  // BUT: only bind it to the store when the embed backend is LOCAL. When a
+  // remote embed backend is configured (QMD_REMOTE_API_KEY set and
+  // QMD_EMBED_BACKEND !== "local"), binding a concrete LlamaCpp to
+  // `internal.llm` is a bug: store.ts:getLlm() prefers store.llm over the
+  // HybridLLM singleton, and store.ts:resolveEmbedModelForStore() short-
+  // circuits on store.llm.embedModelName. Both would force the LOCAL
+  // embeddinggemma model (768-dim) for the query vector, while the index
+  // column was built with the REMOTE model (e.g. 1024-dim) — producing
+  // "Dimension mismatch for query vector ... Expected 1024 ... received 768"
+  // at MCP/SDK query time. The CLI avoids this by never binding store.llm and
+  // routing through getDefaultLLM() (the HybridLLM). Mirror that here.
+  // See docs/qmd-remote-llm-port-audit-2026-06-26.md §7 and the qmd-port skill.
+  const remoteEmbedActive =
+    !!process.env.QMD_REMOTE_API_KEY && process.env.QMD_EMBED_BACKEND !== "local";
+
+  // The local LlamaCpp is still needed for local-only roles even in full-remote
+  // mode (tokenization/chunking default to the local backend), and it must
+  // never be handed a remote model name (it would try to load it as a GGUF).
+  // Sanitize each role: a configured model that isn't a local GGUF URI falls
+  // back to the local default.
+  const isLocalModelUri = (m: string | undefined): boolean =>
+    !!m && (m.startsWith("hf:") || m.endsWith(".gguf")
+      || m.startsWith("/") || m.startsWith("./") || m.startsWith("~"));
+  const localEmbed = isLocalModelUri(config?.models?.embed)
+    ? config!.models!.embed : DEFAULT_EMBED_MODEL_URI;
+  const localGenerate = isLocalModelUri(config?.models?.generate)
+    ? config!.models!.generate : resolveGenerateModel();
+  const localRerank = isLocalModelUri(config?.models?.rerank)
+    ? config!.models!.rerank : resolveRerankModel();
+
   const llm = new LlamaCpp({
-    embedModel: config?.models?.embed,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
+    embedModel: localEmbed,
+    generateModel: localGenerate,
+    rerankModel: localRerank,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
-  internal.llm = llm;
+
+  if (remoteEmbedActive) {
+    // Remote embed path: do NOT bind store.llm. Register the (sanitized,
+    // local-only) LlamaCpp as the default local backend so the HybridLLM
+    // singleton can use it for tokenization, then let getLlm(internal) fall
+    // back to getDefaultLLM() (HybridLLM) — which routes embed to the remote
+    // model and produces vectors that match the remote-built index column.
+    setDefaultLlamaCpp(llm);
+    // Touch getDefaultLLM() so the HybridLLM singleton is built around this
+    // local instance up-front (rather than lazily on first embed).
+    getDefaultLLM();
+  } else {
+    // Local embed path: original behaviour — bind the per-store LlamaCpp.
+    internal.llm = llm;
+  }
+
+  // Resolve the embed-model NAME used for sqlite-vec keying on the low-level
+  // searchVector() SDK call. Must match what the actual embed() will use:
+  // when remote embed is active the query is embedded by the remote model
+  // (and stored under that model's name / dimension), so we must key the
+  // sqlite-vec lookup with the remote name too — not the local LlamaCpp's.
+  // The main search() path already does this via resolveEmbedModelForStore().
+  const resolveStoreEmbedModel = (): string => {
+    if (remoteEmbedActive) {
+      const remote = process.env.QMD_REMOTE_EMBED_MODEL;
+      if (remote) return remote;
+    }
+    return llm.embedModelName;
+  };
 
   const store: QMDStore = {
     internal,
@@ -428,7 +492,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
+    searchVector: async (q, opts) => internal.searchVec(q, resolveStoreEmbedModel(), opts?.limit, opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
