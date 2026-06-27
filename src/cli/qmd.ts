@@ -650,7 +650,16 @@ async function showStatus(): Promise<void> {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
-    const activeModels = resolveModelsForCli();
+    // Report the models that will ACTUALLY be used. resolve*ForCli() are
+    // remote-aware: when a remote backend is configured they return the
+    // remote model name, otherwise the local URI. Using resolveModelsForCli()
+    // here (local-only) made `qmd status` always claim local models even with
+    // QMD_*_BACKEND=remote set — misleading. See the remote-llm port audit.
+    const activeModels = {
+      embed: resolveEmbedModelForCli(),
+      rerank: resolveRerankModelForCli(),
+      generate: resolveGenerateModelForCli(),
+    };
     console.log(`\n${c.bold}Models${c.reset}`);
     console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
     console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
@@ -1898,10 +1907,23 @@ export function resolveEmbedModelForCli(): string {
 }
 
 export function resolveGenerateModelForCli(): string {
+  // Mirror resolveEmbedModelForCli: when the remote generate backend is
+  // configured, report the remote model that HybridLLM.generate actually
+  // calls — not the local config URI. Keeps `qmd status` / log lines honest.
+  if (process.env.QMD_REMOTE_API_KEY && process.env.QMD_GENERATE_BACKEND === "remote") {
+    const remote = process.env.QMD_REMOTE_GENERATE_MODEL;
+    if (remote) return remote;
+  }
   return ensureModelsConfiguredForCli().generate;
 }
 
 export function resolveRerankModelForCli(): string {
+  // Mirror resolveEmbedModelForCli: when the remote rerank backend is
+  // configured, report the remote model that HybridLLM.rerank actually calls.
+  if (process.env.QMD_REMOTE_API_KEY && process.env.QMD_RERANK_BACKEND === "remote") {
+    const remote = process.env.QMD_REMOTE_RERANK_MODEL;
+    if (remote) return remote;
+  }
   return ensureModelsConfiguredForCli().rerank;
 }
 

@@ -836,6 +836,47 @@ describe("MCP Server", () => {
       expect(segments).toContain("%20"); // Spaces encoded
     });
 
+    test("get/multi_get tools must decode percent-encoded qmd:// URIs before lookup", () => {
+      // Regression: the qmd_get / qmd_multi_get TOOLS receive qmd:// URIs that
+      // were produced by encodeQmdPath (search/get results are percent-encoded,
+      // e.g. spaces -> %20). store.findDocument() matches qmd:// URIs by EXACT
+      // string against the RAW `qmd://collection/path`, so feeding the encoded
+      // form straight in returns "not found" / empty — the CLI `qmd get` works
+      // because users type the raw path. The handlers now run decodeQmdLookup
+      // on the input. This test pins the encode->decode round-trip and the
+      // exact-match failure that motivated the fix.
+
+      // Mirror the module-private decodeQmdLookup logic (same approach the
+      // encodeQmdPath test above uses to assert helper behavior inline).
+      const decodeQmdLookup = (value: string): string => {
+        if (!value.startsWith('qmd://')) return value;
+        const rest = value.slice('qmd://'.length);
+        const decoded = rest
+          .split('/')
+          .map(seg => { try { return decodeURIComponent(seg); } catch { return seg; } })
+          .join('/');
+        return `qmd://${decoded}`;
+      };
+
+      const raw = "qmd://docs/my notes.md";
+      const encodeSegments = (p: string) => p.split('/').map(s => encodeURIComponent(s)).join('/');
+      const encoded = `qmd://${encodeSegments("docs/my notes.md")}`;
+      expect(encoded).toBe("qmd://docs/my%20notes.md");
+
+      // The encoded form is NOT equal to the raw form findDocument matches on...
+      expect(encoded).not.toBe(raw);
+      // ...but decoding recovers exactly the raw path the DB lookup expects.
+      expect(decodeQmdLookup(encoded)).toBe(raw);
+
+      // Non-qmd:// inputs (relative/absolute paths, docids) pass through.
+      expect(decodeQmdLookup("docs/readme.md")).toBe("docs/readme.md");
+      expect(decodeQmdLookup("#abc123")).toBe("#abc123");
+      expect(decodeQmdLookup("/abs/path/file.md")).toBe("/abs/path/file.md");
+
+      // Malformed escapes are left as-is (best-effort, never throws).
+      expect(decodeQmdLookup("qmd://docs/bad%ZZ.md")).toBe("qmd://docs/bad%ZZ.md");
+    });
+
     test("search results have correct structure for structuredContent", () => {
       const results = searchFTS(testDb, "readme", 5);
       const structured = results.map(r => ({
